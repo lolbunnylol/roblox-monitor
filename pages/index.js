@@ -20,6 +20,7 @@ export default function Home() {
   const audioCtxRef = useRef(null);
   const activeRef = useRef(false); // true only while monitoring is actually running
   const abortRef = useRef(null); // AbortController for the in-flight request
+  const rateLimitStreakRef = useRef(0); // consecutive 429s, used to back off polling speed
 
   // Register service worker + check notification permission
   useEffect(() => {
@@ -92,19 +93,31 @@ export default function Home() {
   const doCheck = useCallback(
     async (id, signal) => {
       try {
-        pushLog(`Checking #${checkCountRef.current + 1}…`, "info");
         const res = await fetch(`/api/price?id=${id}`, { signal });
         if (!activeRef.current) return; // stopped while the request was in flight
 
         if (!res.ok) {
-          let detail = "";
+          let body = null;
           try {
-            const body = await res.json();
-            if (body?.error) detail = ` (${body.error}${body.robloxStatus ? `, HTTP ${body.robloxStatus}` : ""})`;
+            body = await res.json();
           } catch (_) {}
+
+          if (body?.rateLimited) {
+            rateLimitStreakRef.current += 1;
+            if (rateLimitStreakRef.current === 1) {
+              pushLog("Rate limited by Roblox — slowing down…", "warn");
+            }
+            return { rateLimited: true };
+          }
+
+          rateLimitStreakRef.current = 0;
+          const detail = body?.error
+            ? ` (${body.error}${body.robloxStatus ? `, HTTP ${body.robloxStatus}` : ""})`
+            : "";
           pushLog(`API error — retrying…${detail}`, "warn");
           return;
         }
+        rateLimitStreakRef.current = 0;
         const data = await res.json();
         if (!activeRef.current) return; // stopped while parsing
         const { price, name } = data;
@@ -173,7 +186,8 @@ export default function Home() {
       const controller = new AbortController();
       abortRef.current = controller;
       try {
-        await doCheck(id, controller.signal);
+        const result = await doCheck(id, controller.signal);
+        return result;
       } finally {
         if (abortRef.current === controller) abortRef.current = null;
       }
@@ -183,14 +197,17 @@ export default function Home() {
 
   // Self-scheduling loop: the next check is only queued once the previous
   // one has fully finished, so slow/backed-up API calls can never overlap
-  // or keep firing faster than they resolve.
+  // or keep firing faster than they resolve. When Roblox rate-limits us
+  // (429), back off exponentially instead of hammering it at the same
+  // interval — capped at 8s so it still recovers reasonably fast.
   const scheduleNext = useCallback(
     (id) => {
       timerRef.current = setTimeout(async () => {
         if (!activeRef.current) return;
-        await runCheck(id);
-        if (activeRef.current) scheduleNext(id);
-      }, interval);
+        const result = await runCheck(id);
+        if (!activeRef.current) return;
+        scheduleNext(id);
+      }, rateLimitStreakRef.current > 0 ? Math.min(interval * 2 ** rateLimitStreakRef.current, 8000) : interval);
     },
     [interval, runCheck]
   );

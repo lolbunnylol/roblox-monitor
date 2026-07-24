@@ -34,108 +34,70 @@ export default async function handler(req, res) {
     );
   };
 
-  // Run all 4 lookups in PARALLEL (not sequential) with a short per-call
-  // timeout. Sequential lookups with an 8s timeout each meant a single
-  // check could take up to ~32s in the worst case, which made monitoring
-  // feel frozen once overlapping/duplicate checks were fixed elsewhere.
-  // Priority order still applies (economy v2 > catalog v1 > resale >
-  // marketplace) when merging whichever results actually resolved.
+  // Two-stage lookup instead of always firing all 4 endpoints:
+  //   Stage 1 (parallel): economy v2 + catalog v1 — covers most items.
+  //   Stage 2 (parallel, only if stage 1 came up empty): resale + marketplace.
+  // This roughly halves the request volume sent to Roblox per check for
+  // the common case, which matters because at fast polling intervals
+  // (e.g. 0.2s) firing all 4 every time trips Roblox's own rate limiting
+  // (HTTP 429) very quickly.
   const TIMEOUT_MS = 5000;
 
-  const economyV2 = fetchWithTimeout(
-    `https://economy.roblox.com/v2/assets/${id}/details`,
-    { headers: BROWSER_HEADERS },
-    TIMEOUT_MS
-  )
-    .then(async (r) => ({
-      status: r.status,
-      ok: r.ok,
-      data: r.ok ? await r.json() : null,
-    }))
-    .catch(() => null);
-
-  const catalogV1 = fetchWithTimeout(
-    `https://catalog.roblox.com/v1/catalog/items/${id}/details`,
-    { headers: BROWSER_HEADERS },
-    TIMEOUT_MS
-  )
-    .then(async (r) => ({
-      status: r.status,
-      ok: r.ok,
-      data: r.ok ? await r.json() : null,
-    }))
-    .catch(() => null);
-
-  const resaleData = fetchWithTimeout(
-    `https://economy.roblox.com/v1/assets/${id}/resale-data`,
-    { headers: BROWSER_HEADERS },
-    TIMEOUT_MS
-  )
-    .then(async (r) => ({
-      status: r.status,
-      ok: r.ok,
-      data: r.ok ? await r.json() : null,
-    }))
-    .catch(() => null);
-
-  const marketplace = fetchWithTimeout(
-    `https://marketplace.roblox.com/v1/assets/${id}/resellers?limit=1`,
-    { headers: BROWSER_HEADERS },
-    TIMEOUT_MS
-  )
-    .then(async (r) => ({
-      status: r.status,
-      ok: r.ok,
-      data: r.ok ? await r.json() : null,
-    }))
-    .catch(() => null);
-
-  const [rEconomyV2, rCatalogV1, rResale, rMarketplace] = await Promise.all([
-    economyV2,
-    catalogV1,
-    resaleData,
-    marketplace,
-  ]);
+  const call = (url) =>
+    fetchWithTimeout(url, { headers: BROWSER_HEADERS }, TIMEOUT_MS)
+      .then(async (r) => ({
+        status: r.status,
+        ok: r.ok,
+        data: r.ok ? await r.json() : null,
+      }))
+      .catch(() => null);
 
   let itemName = null;
   let price = null;
   let lastStatus = null;
+  let sawRateLimit = false;
 
-  // 1. economy v2 — works for classic catalog items
-  if (rEconomyV2) {
-    if (lastStatus == null) lastStatus = rEconomyV2.status;
-    if (rEconomyV2.ok) {
-      itemName = rEconomyV2.data.Name ?? null;
-      price = rEconomyV2.data.PriceInRobux != null ? Number(rEconomyV2.data.PriceInRobux) : null;
+  const noteStatus = (r) => {
+    if (!r) return;
+    if (lastStatus == null) lastStatus = r.status;
+    if (r.status === 429) sawRateLimit = true;
+  };
+
+  // Stage 1
+  const [rEconomyV2, rCatalogV1] = await Promise.all([
+    call(`https://economy.roblox.com/v2/assets/${id}/details`),
+    call(`https://catalog.roblox.com/v1/catalog/items/${id}/details`),
+  ]);
+  noteStatus(rEconomyV2);
+  noteStatus(rCatalogV1);
+
+  if (rEconomyV2?.ok) {
+    itemName = rEconomyV2.data.Name ?? null;
+    price = rEconomyV2.data.PriceInRobux != null ? Number(rEconomyV2.data.PriceInRobux) : null;
+  }
+  if ((price == null || itemName == null) && rCatalogV1?.ok) {
+    if (itemName == null) itemName = rCatalogV1.data.name ?? null;
+    if (price == null) {
+      const p = rCatalogV1.data.price ?? rCatalogV1.data.lowestPrice ?? null;
+      price = p != null ? Number(p) : null;
     }
   }
 
-  // 2. catalog v1 — newer UGC items & bundles
-  if ((price == null || itemName == null) && rCatalogV1) {
-    if (lastStatus == null) lastStatus = rCatalogV1.status;
-    if (rCatalogV1.ok) {
-      if (itemName == null) itemName = rCatalogV1.data.name ?? null;
-      if (price == null) {
-        const p = rCatalogV1.data.price ?? rCatalogV1.data.lowestPrice ?? null;
-        price = p != null ? Number(p) : null;
-      }
-    }
-  }
+  // Stage 2 — only run if stage 1 didn't give us both a name and a price
+  if (price == null || itemName == null) {
+    const [rResale, rMarketplace] = await Promise.all([
+      call(`https://economy.roblox.com/v1/assets/${id}/resale-data`),
+      call(`https://marketplace.roblox.com/v1/assets/${id}/resellers?limit=1`),
+    ]);
+    noteStatus(rResale);
+    noteStatus(rMarketplace);
 
-  // 3. resale data — limiteds without a fixed price
-  if (price == null && rResale) {
-    if (lastStatus == null) lastStatus = rResale.status;
-    if (rResale.ok) {
+    if (price == null && rResale?.ok) {
       const p = rResale.data.price ?? null;
       price = p != null ? Number(p) : null;
       if (itemName == null) itemName = "Limited Item";
     }
-  }
-
-  // 4. marketplace v1 — another fallback for some item types
-  if ((price == null || itemName == null) && rMarketplace) {
-    if (lastStatus == null) lastStatus = rMarketplace.status;
-    if (rMarketplace.ok) {
+    if ((price == null || itemName == null) && rMarketplace?.ok) {
       const lowestPrice = rMarketplace.data?.data?.[0]?.price ?? null;
       if (price == null && lowestPrice != null) price = Number(lowestPrice);
       if (itemName == null) itemName = "Marketplace Item";
@@ -143,10 +105,14 @@ export default async function handler(req, res) {
   }
 
   if (itemName == null && price == null) {
-    // Surface the actual HTTP status so you can debug in logs
-    return res.status(404).json({
-      error: "Item not found or Roblox API unavailable",
+    // Surface the actual HTTP status (and whether it was a rate limit)
+    // so the client can back off instead of just retrying at full speed.
+    return res.status(sawRateLimit ? 429 : 404).json({
+      error: sawRateLimit
+        ? "Rate limited by Roblox"
+        : "Item not found or Roblox API unavailable",
       robloxStatus: lastStatus,
+      rateLimited: sawRateLimit,
     });
   }
 
