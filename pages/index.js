@@ -92,6 +92,7 @@ export default function Home() {
   const doCheck = useCallback(
     async (id, signal) => {
       try {
+        pushLog(`Checking #${checkCountRef.current + 1}…`, "info");
         const res = await fetch(`/api/price?id=${id}`, { signal });
         if (!activeRef.current) return; // stopped while the request was in flight
 
