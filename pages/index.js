@@ -18,6 +18,8 @@ export default function Home() {
   const checkCountRef = useRef(0);
   const logsEndRef = useRef(null);
   const audioCtxRef = useRef(null);
+  const activeRef = useRef(false); // true only while monitoring is actually running
+  const abortRef = useRef(null); // AbortController for the in-flight request
 
   // Register service worker + check notification permission
   useEffect(() => {
@@ -88,11 +90,22 @@ export default function Home() {
   };
 
   const doCheck = useCallback(
-    async (id) => {
+    async (id, signal) => {
       try {
-        const res = await fetch(`/api/price?id=${id}`);
-        if (!res.ok) { pushLog("API error — retrying…", "warn"); return; }
+        const res = await fetch(`/api/price?id=${id}`, { signal });
+        if (!activeRef.current) return; // stopped while the request was in flight
+
+        if (!res.ok) {
+          let detail = "";
+          try {
+            const body = await res.json();
+            if (body?.error) detail = ` (${body.error}${body.robloxStatus ? `, HTTP ${body.robloxStatus}` : ""})`;
+          } catch (_) {}
+          pushLog(`API error — retrying…${detail}`, "warn");
+          return;
+        }
         const data = await res.json();
+        if (!activeRef.current) return; // stopped while parsing
         const { price, name } = data;
 
         checkCountRef.current += 1;
@@ -142,11 +155,43 @@ export default function Home() {
             "info"
           );
         }
-      } catch {
+      } catch (err) {
+        if (err?.name === "AbortError") return; // intentional cancel — not a real error
+        if (!activeRef.current) return;
         pushLog("Network error — retrying…", "warn");
       }
     },
     [pushLog, sendNotification, playPew]
+  );
+
+  // Runs one check with its own AbortController, tracked in abortRef so
+  // stopMonitoring() can cancel it immediately instead of letting it
+  // finish (and keep logging) after the user has hit Stop.
+  const runCheck = useCallback(
+    async (id) => {
+      const controller = new AbortController();
+      abortRef.current = controller;
+      try {
+        await doCheck(id, controller.signal);
+      } finally {
+        if (abortRef.current === controller) abortRef.current = null;
+      }
+    },
+    [doCheck]
+  );
+
+  // Self-scheduling loop: the next check is only queued once the previous
+  // one has fully finished, so slow/backed-up API calls can never overlap
+  // or keep firing faster than they resolve.
+  const scheduleNext = useCallback(
+    (id) => {
+      timerRef.current = setTimeout(async () => {
+        if (!activeRef.current) return;
+        await runCheck(id);
+        if (activeRef.current) scheduleNext(id);
+      }, interval);
+    },
+    [interval, runCheck]
   );
 
   const startMonitoring = async () => {
@@ -161,18 +206,31 @@ export default function Home() {
     lastPriceRef.current = undefined;
     setItemName(null);
     setCurrentPrice(null);
+    activeRef.current = true;
     setMonitoring(true);
-    await doCheck(itemId);
-    timerRef.current = setInterval(() => doCheck(itemId), interval);
+    await runCheck(itemId);
+    if (activeRef.current) scheduleNext(itemId);
   };
 
   const stopMonitoring = () => {
-    clearInterval(timerRef.current);
+    activeRef.current = false; // blocks any in-flight/pending check from doing anything further
+    clearTimeout(timerRef.current);
+    timerRef.current = null;
+    if (abortRef.current) {
+      abortRef.current.abort(); // actually cancels the in-flight fetch
+      abortRef.current = null;
+    }
     setMonitoring(false);
     pushLog(`Stopped after ${checkCountRef.current} checks.`, "info");
   };
 
-  useEffect(() => () => clearInterval(timerRef.current), []);
+  useEffect(() => {
+    return () => {
+      activeRef.current = false;
+      clearTimeout(timerRef.current);
+      if (abortRef.current) abortRef.current.abort();
+    };
+  }, []);
 
   return (
     <>
