@@ -1,7 +1,69 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import Head from "next/head";
 
+// Update this list whenever you ship a change — newest entry first.
+// Rendered as-is in the Changelog card at the bottom of the page.
+const CHANGELOG = [
+  {
+    version: "v1.3",
+    date: "2026-07-25",
+    changes: [
+      "Added Discord webhook alerts with per-event toggles (price up/down, off sale, back on sale)",
+      "Added optional single-user ping targeting for Discord alerts, with an anti-raid guard (never @everyone/@here, always locked to one Discord user ID)",
+      "Added optional \"spam ping\" mode (up to 5 messages in a row) so an alert can't get missed",
+      "Added a volume slider and a test-sound button for the pew-pew alert",
+      "Added this changelog section",
+    ],
+  },
+  {
+    version: "v1.2",
+    date: "2026-07-25",
+    changes: [
+      "Fixed rate-limit backoff streak carrying over between Start/Stop sessions",
+      "Stopped firing fallback API lookups while already being rate-limited by Roblox",
+      "Fixed misleading HTTP status shown in error logs",
+      "Fixed the pew-pew sound sometimes not playing on the very first alert (audio now unlocks on the Start click)",
+      "Added a demo item (ID 12345678) that goes off-sale on check #50, for testing alerts on demand",
+    ],
+  },
+  {
+    version: "v1.1",
+    date: "2026-07-25",
+    changes: [
+      "Parallelized Roblox lookups (2-stage instead of 4-sequential) — fixed ~30s silent delays on the first check",
+      "Added exponential backoff and a clearer message when Roblox rate-limits requests (HTTP 429)",
+    ],
+  },
+  {
+    version: "v1.0",
+    date: "2026-07-24",
+    changes: [
+      "Fixed checks overlapping/piling up when the API responded slowly",
+      "Fixed monitoring continuing to log after pressing Stop — checks are now properly cancelled",
+    ],
+  },
+];
+
+const SETTINGS_KEY = "robloxMonitorSettings";
+
+const DISCORD_COLORS = {
+  up: 0xff6644,
+  down: 0x44aaff,
+  offSale: 0xcc8844,
+  backOnSale: 0x44cc88,
+  test: 0x8888ff,
+};
+
 export default function Home() {
+  // A fully client-side simulated item — no network call, no rate limits.
+  // Stays at a fixed price for the first 49 checks, then goes "off sale"
+  // on the 50th check so you can see/hear the off-sale alert on demand
+  // instead of waiting for a real item to happen to sell out.
+  const DEMO_ITEM_ID = "12345678";
+  const DEMO_ITEM_NAME = "Demo Blade (Test Item)";
+  const DEMO_PRICE = 4200;
+  const DEMO_OFFSALE_AT_CHECK = 50;
+
   const [itemId, setItemId] = useState("");
   const [interval, setIntervalMs] = useState(500);
   const [monitoring, setMonitoring] = useState(false);
@@ -13,6 +75,24 @@ export default function Home() {
   const [notifPerm, setNotifPerm] = useState("default");
   const [swReg, setSwReg] = useState(null);
 
+  // Discord webhook settings
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [discordUserId, setDiscordUserId] = useState("");
+  const [alertTypes, setAlertTypes] = useState({
+    up: true,
+    down: true,
+    offSale: true,
+    backOnSale: true,
+  });
+  const [pingMe, setPingMe] = useState(false);
+  const [spamPings, setSpamPings] = useState(false);
+  const [spamCount, setSpamCount] = useState(3);
+  const [discordStatus, setDiscordStatus] = useState(null);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+
+  // Sound
+  const [volume, setVolume] = useState(70);
+
   const timerRef = useRef(null);
   const lastPriceRef = useRef(undefined);
   const checkCountRef = useRef(0);
@@ -22,6 +102,26 @@ export default function Home() {
   const abortRef = useRef(null); // AbortController for the in-flight request
   const rateLimitStreakRef = useRef(0); // consecutive 429s, used to back off polling speed
 
+  // Refs mirroring the Discord/volume settings state, so callbacks that
+  // don't want to be recreated on every keystroke (doCheck's dependency
+  // chain in particular) can always read the *current* value without
+  // needing to be in a dependency array.
+  const webhookUrlRef = useRef("");
+  const discordUserIdRef = useRef("");
+  const alertTypesRef = useRef(alertTypes);
+  const pingMeRef = useRef(false);
+  const spamPingsRef = useRef(false);
+  const spamCountRef = useRef(3);
+  const volumeRef = useRef(70);
+
+  useEffect(() => { webhookUrlRef.current = webhookUrl; }, [webhookUrl]);
+  useEffect(() => { discordUserIdRef.current = discordUserId; }, [discordUserId]);
+  useEffect(() => { alertTypesRef.current = alertTypes; }, [alertTypes]);
+  useEffect(() => { pingMeRef.current = pingMe; }, [pingMe]);
+  useEffect(() => { spamPingsRef.current = spamPings; }, [spamPings]);
+  useEffect(() => { spamCountRef.current = spamCount; }, [spamCount]);
+  useEffect(() => { volumeRef.current = volume; }, [volume]);
+
   // Register service worker + check notification permission
   useEffect(() => {
     if ("serviceWorker" in navigator) {
@@ -29,6 +129,37 @@ export default function Home() {
     }
     if ("Notification" in window) setNotifPerm(Notification.permission);
   }, []);
+
+  // Load saved settings (Discord + volume) once on mount
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+      if (typeof saved.webhookUrl === "string") setWebhookUrl(saved.webhookUrl);
+      if (typeof saved.discordUserId === "string") setDiscordUserId(saved.discordUserId);
+      if (saved.alertTypes) setAlertTypes({ up: true, down: true, offSale: true, backOnSale: true, ...saved.alertTypes });
+      if (typeof saved.pingMe === "boolean") setPingMe(saved.pingMe);
+      if (typeof saved.spamPings === "boolean") setSpamPings(saved.spamPings);
+      if (typeof saved.spamCount === "number") setSpamCount(saved.spamCount);
+      if (typeof saved.volume === "number") setVolume(saved.volume);
+    } catch (_) {
+      // ignore malformed/missing settings
+    } finally {
+      setSettingsLoaded(true);
+    }
+  }, []);
+
+  // Persist settings whenever they change (skip the very first render so
+  // we don't immediately overwrite saved settings with defaults before
+  // they've been loaded)
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    try {
+      localStorage.setItem(
+        SETTINGS_KEY,
+        JSON.stringify({ webhookUrl, discordUserId, alertTypes, pingMe, spamPings, spamCount, volume })
+      );
+    } catch (_) {}
+  }, [settingsLoaded, webhookUrl, discordUserId, alertTypes, pingMe, spamPings, spamCount, volume]);
 
   // Auto-scroll log
   useEffect(() => {
@@ -43,13 +174,27 @@ export default function Home() {
     ]);
   }, []);
 
-  // Pew pew sound via Web Audio API — no file needed
-  const playPew = useCallback(() => {
+  const ensureAudioUnlocked = useCallback(() => {
     try {
       if (!audioCtxRef.current) {
         audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
       }
+      if (audioCtxRef.current.state === "suspended") {
+        audioCtxRef.current.resume();
+      }
+    } catch (_) {}
+  }, []);
+
+  // Pew pew sound via Web Audio API — no file needed. Reads volume from
+  // a ref so it's always current without needing playPew itself to be
+  // recreated (and cascade-recreate doCheck/runCheck/scheduleNext) every
+  // time the slider moves.
+  const playPew = useCallback(() => {
+    try {
+      ensureAudioUnlocked();
       const ctx = audioCtxRef.current;
+      const peak = 0.5 * (volumeRef.current / 100);
+      if (peak <= 0) return; // muted
 
       const playOnePew = (startTime) => {
         const osc = ctx.createOscillator();
@@ -62,8 +207,8 @@ export default function Home() {
         osc.frequency.setValueAtTime(1400, startTime);
         osc.frequency.exponentialRampToValueAtTime(200, startTime + 0.18);
 
-        gain.gain.setValueAtTime(0.35, startTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, startTime + 0.2);
+        gain.gain.setValueAtTime(peak, startTime);
+        gain.gain.exponentialRampToValueAtTime(Math.max(peak * 0.003, 0.0001), startTime + 0.2);
 
         osc.start(startTime);
         osc.stop(startTime + 0.2);
@@ -73,7 +218,12 @@ export default function Home() {
       playOnePew(ctx.currentTime);
       playOnePew(ctx.currentTime + 0.25);
     } catch (_) {}
-  }, []);
+  }, [ensureAudioUnlocked]);
+
+  const testSound = () => {
+    ensureAudioUnlocked();
+    playPew();
+  };
 
   const sendNotification = useCallback(
     (title, body) => {
@@ -90,37 +240,122 @@ export default function Home() {
     setNotifPerm(perm);
   };
 
+  // Sends a Discord webhook message for a given event `kind`
+  // ("up" | "down" | "offSale" | "backOnSale" | "test").
+  //
+  // Anti-raid guard: pings are ONLY ever sent to the single Discord user
+  // ID configured in settings, via `allowed_mentions.users`, and
+  // `allowed_mentions.parse` is explicitly set to an empty array so
+  // Discord will never resolve @everyone/@here/@role even if such text
+  // somehow ended up in the message content. There is no way to target
+  // more than one user or a role/channel from this UI.
+  const sendDiscordAlert = useCallback(async (kind, title, description) => {
+    const url = webhookUrlRef.current.trim();
+    if (!url) return { ok: false, reason: "No webhook URL configured." };
+
+    if (kind !== "test" && !alertTypesRef.current[kind]) {
+      return { ok: false, reason: "Alert type disabled." };
+    }
+
+    const rawId = discordUserIdRef.current.trim();
+    const validUserId = /^\d{15,20}$/.test(rawId);
+    const shouldPing = pingMeRef.current && validUserId;
+    const mention = shouldPing ? `<@${rawId}> ` : "";
+
+    const payload = {
+      content: `${mention}${title}`.trim(),
+      embeds: [
+        {
+          description,
+          color: DISCORD_COLORS[kind] ?? 0x888888,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      allowed_mentions: {
+        parse: [], // never resolve @everyone/@here/@role
+        users: shouldPing ? [rawId] : [], // only ever this one user, if any
+      },
+    };
+
+    const times = spamPingsRef.current && shouldPing
+      ? Math.max(1, Math.min(spamCountRef.current, 5))
+      : 1;
+
+    let lastOk = true;
+    for (let i = 0; i < times; i++) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        lastOk = res.ok;
+      } catch (_) {
+        lastOk = false;
+      }
+      if (i < times - 1) await new Promise((r) => setTimeout(r, 500));
+    }
+
+    return lastOk
+      ? { ok: true }
+      : { ok: false, reason: "Discord rejected the request — check the webhook URL." };
+  }, []);
+
+  const handleTestDiscordAlert = async () => {
+    setDiscordStatus("sending");
+    const result = await sendDiscordAlert(
+      "test",
+      "🔔 Test alert",
+      "This is a test message from Roblox Price Monitor."
+    );
+    setDiscordStatus(result.ok ? "sent" : `error:${result.reason || "Failed to send."}`);
+    setTimeout(() => setDiscordStatus(null), 4000);
+  };
+
   const doCheck = useCallback(
     async (id, signal) => {
       try {
-        const res = await fetch(`/api/price?id=${id}`, { signal });
-        if (!activeRef.current) return; // stopped while the request was in flight
+        let price, name;
 
-        if (!res.ok) {
-          let body = null;
-          try {
-            body = await res.json();
-          } catch (_) {}
+        if (id === DEMO_ITEM_ID) {
+          // Simulated — small artificial delay so it still feels like a
+          // real check, but no fetch, no rate limits, fully deterministic.
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          if (!activeRef.current) return;
+          const nextCheckNum = checkCountRef.current + 1;
+          name = DEMO_ITEM_NAME;
+          price = nextCheckNum >= DEMO_OFFSALE_AT_CHECK ? null : DEMO_PRICE;
+        } else {
+          const res = await fetch(`/api/price?id=${id}`, { signal });
+          if (!activeRef.current) return; // stopped while the request was in flight
 
-          if (body?.rateLimited) {
-            rateLimitStreakRef.current += 1;
-            if (rateLimitStreakRef.current === 1) {
-              pushLog("Rate limited by Roblox — slowing down…", "warn");
+          if (!res.ok) {
+            let body = null;
+            try {
+              body = await res.json();
+            } catch (_) {}
+
+            if (body?.rateLimited) {
+              rateLimitStreakRef.current += 1;
+              if (rateLimitStreakRef.current === 1) {
+                pushLog("Rate limited by Roblox — slowing down…", "warn");
+              }
+              return { rateLimited: true };
             }
-            return { rateLimited: true };
-          }
 
+            rateLimitStreakRef.current = 0;
+            const detail = body?.error
+              ? ` (${body.error}${body.robloxStatus ? `, HTTP ${body.robloxStatus}` : ""})`
+              : "";
+            pushLog(`API error — retrying…${detail}`, "warn");
+            return;
+          }
           rateLimitStreakRef.current = 0;
-          const detail = body?.error
-            ? ` (${body.error}${body.robloxStatus ? `, HTTP ${body.robloxStatus}` : ""})`
-            : "";
-          pushLog(`API error — retrying…${detail}`, "warn");
-          return;
+          const data = await res.json();
+          if (!activeRef.current) return; // stopped while parsing
+          price = data.price;
+          name = data.name;
         }
-        rateLimitStreakRef.current = 0;
-        const data = await res.json();
-        if (!activeRef.current) return; // stopped while parsing
-        const { price, name } = data;
 
         checkCountRef.current += 1;
         setCheckCount(checkCountRef.current);
@@ -143,20 +378,24 @@ export default function Home() {
           if (price != null && prev != null) {
             const diff = price - prev;
             const dir = diff > 0 ? "📈 UP" : "📉 DOWN";
-            pushLog(
-              `${dir}  R$ ${prev.toLocaleString()} → R$ ${price.toLocaleString()}  (${diff > 0 ? "+" : ""}${diff.toLocaleString()})`,
-              diff > 0 ? "up" : "down"
-            );
-            sendNotification(
-              `Price ${diff > 0 ? "increased" : "dropped"} — ${name || id}`,
-              `${dir}  R$ ${prev.toLocaleString()} → R$ ${price.toLocaleString()}`
-            );
+            const kind = diff > 0 ? "up" : "down";
+            const title = `Price ${diff > 0 ? "increased" : "dropped"} — ${name || id}`;
+            const body = `${dir}  R$ ${prev.toLocaleString()} → R$ ${price.toLocaleString()}  (${diff > 0 ? "+" : ""}${diff.toLocaleString()})`;
+            pushLog(body, kind);
+            sendNotification(title, body);
+            sendDiscordAlert(kind, title, body);
           } else if (price == null) {
+            const title = `Off sale — ${name || id}`;
+            const body = `Was R$ ${prev.toLocaleString()}`;
             pushLog(`Off sale (was R$ ${prev.toLocaleString()})`, "warn");
-            sendNotification(`Off sale — ${name || id}`, `Was R$ ${prev.toLocaleString()}`);
+            sendNotification(title, body);
+            sendDiscordAlert("offSale", title, body);
           } else {
+            const title = `Back on sale — ${name || id}`;
+            const body = `R$ ${price.toLocaleString()}`;
             pushLog(`Back on sale — R$ ${price.toLocaleString()}`, "good");
-            sendNotification(`Back on sale — ${name || id}`, `R$ ${price.toLocaleString()}`);
+            sendNotification(title, body);
+            sendDiscordAlert("backOnSale", title, body);
           }
           playPew();
           lastPriceRef.current = price;
@@ -175,7 +414,7 @@ export default function Home() {
         pushLog("Network error — retrying…", "warn");
       }
     },
-    [pushLog, sendNotification, playPew]
+    [pushLog, sendNotification, sendDiscordAlert, playPew]
   );
 
   // Runs one check with its own AbortController, tracked in abortRef so
@@ -204,7 +443,7 @@ export default function Home() {
     (id) => {
       timerRef.current = setTimeout(async () => {
         if (!activeRef.current) return;
-        const result = await runCheck(id);
+        await runCheck(id);
         if (!activeRef.current) return;
         scheduleNext(id);
       }, rateLimitStreakRef.current > 0 ? Math.min(interval * 2 ** rateLimitStreakRef.current, 8000) : interval);
@@ -222,10 +461,18 @@ export default function Home() {
     setCheckCount(0);
     checkCountRef.current = 0;
     lastPriceRef.current = undefined;
+    rateLimitStreakRef.current = 0;
     setItemName(null);
     setCurrentPrice(null);
     activeRef.current = true;
     setMonitoring(true);
+
+    // Create/unlock the AudioContext here, inside the actual click
+    // handler, so browsers that suspend audio until a real user gesture
+    // don't block the very first pew-pew (which would otherwise fire
+    // later, inside an async callback, after the gesture has "expired").
+    ensureAudioUnlocked();
+
     await runCheck(itemId);
     if (activeRef.current) scheduleNext(itemId);
   };
@@ -249,6 +496,12 @@ export default function Home() {
       if (abortRef.current) abortRef.current.abort();
     };
   }, []);
+
+  const toggleAlertType = (key) => {
+    setAlertTypes((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const discordIdValid = discordUserId === "" || /^\d{15,20}$/.test(discordUserId);
 
   return (
     <>
@@ -278,6 +531,18 @@ export default function Home() {
               disabled={monitoring}
             />
           </div>
+          <p className="hint">
+            Testing it out? Try{" "}
+            <button
+              type="button"
+              className="link-btn"
+              onClick={() => setItemId(DEMO_ITEM_ID)}
+              disabled={monitoring}
+            >
+              demo item {DEMO_ITEM_ID}
+            </button>{" "}
+            — it goes off-sale on check #{DEMO_OFFSALE_AT_CHECK} so you can hear the alert without waiting on a real item.
+          </p>
 
           <div className="field-row">
             <label htmlFor="interval">Interval</label>
@@ -345,6 +610,118 @@ export default function Home() {
           </section>
         )}
 
+        <section className="card sound">
+          <h2>Sound</h2>
+          <div className="field-row">
+            <label htmlFor="volume">Volume</label>
+            <input
+              id="volume"
+              type="range"
+              min={0}
+              max={100}
+              value={volume}
+              onChange={(e) => setVolume(Number(e.target.value))}
+            />
+            <span className="volume-value">{volume === 0 ? "Muted" : `${volume}%`}</span>
+          </div>
+          <div className="btn-row">
+            <button className="btn-notif" onClick={testSound}>Test sound 🔊</button>
+          </div>
+        </section>
+
+        <section className="card discord">
+          <h2>Discord Alerts</h2>
+
+          <div className="field-row">
+            <label htmlFor="webhookUrl">Webhook URL</label>
+            <input
+              id="webhookUrl"
+              type="password"
+              placeholder="https://discord.com/api/webhooks/..."
+              value={webhookUrl}
+              onChange={(e) => setWebhookUrl(e.target.value)}
+            />
+          </div>
+          <p className="hint">
+            Server Settings → Integrations → Webhooks → New Webhook → Copy URL.
+          </p>
+
+          <div className="field-row">
+            <label htmlFor="discordUserId">Your user ID</label>
+            <input
+              id="discordUserId"
+              type="text"
+              placeholder="123456789012345678"
+              value={discordUserId}
+              onChange={(e) => setDiscordUserId(e.target.value.replace(/\D/g, ""))}
+            />
+          </div>
+          {!discordIdValid && (
+            <p className="error">Discord user IDs are 15–20 digits. Enable Developer Mode in Discord, then right-click your name → Copy User ID.</p>
+          )}
+          <p className="hint">
+            Only this exact ID can ever be pinged — alerts never use @everyone, @here, or roles, no matter what.
+          </p>
+
+          <div className="checkbox-group">
+            <span className="checkbox-group-label">Send alerts for</span>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={alertTypes.up} onChange={() => toggleAlertType("up")} />
+              Price increased
+            </label>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={alertTypes.down} onChange={() => toggleAlertType("down")} />
+              Price dropped
+            </label>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={alertTypes.offSale} onChange={() => toggleAlertType("offSale")} />
+              Went off sale
+            </label>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={alertTypes.backOnSale} onChange={() => toggleAlertType("backOnSale")} />
+              Back on sale
+            </label>
+          </div>
+
+          <label className="checkbox-row">
+            <input type="checkbox" checked={pingMe} onChange={(e) => setPingMe(e.target.checked)} />
+            Ping me on matching alerts
+          </label>
+
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={spamPings}
+              onChange={(e) => setSpamPings(e.target.checked)}
+              disabled={!pingMe}
+            />
+            Spam ping (send it
+            <input
+              type="number"
+              min={1}
+              max={5}
+              value={spamCount}
+              disabled={!pingMe || !spamPings}
+              onChange={(e) => setSpamCount(Math.max(1, Math.min(5, Number(e.target.value) || 1)))}
+              className="spam-count"
+            />
+            times in a row so it's not missed)
+          </label>
+          <p className="hint">
+            Capped at 5 messages, and always targeted at your single user ID only — this can't be used to mass-ping a server.
+          </p>
+
+          <div className="btn-row">
+            <button className="btn-notif" onClick={handleTestDiscordAlert} disabled={!webhookUrl.trim()}>
+              {discordStatus === "sending" ? "Sending…" : "Send test alert"}
+            </button>
+            {discordStatus === "sent" && <span className="notif-on">✓ Sent</span>}
+            {typeof discordStatus === "string" && discordStatus.startsWith("error:") && (
+              <span className="error">{discordStatus.slice(6)}</span>
+            )}
+          </div>
+        </section>
+
         {logs.length > 0 && (
           <section className="card log-card">
             <h2>Event log</h2>
@@ -359,6 +736,23 @@ export default function Home() {
             </div>
           </section>
         )}
+
+        <section className="card changelog">
+          <h2>Changelog</h2>
+          {CHANGELOG.map((entry) => (
+            <div className="changelog-entry" key={entry.version}>
+              <div className="changelog-head">
+                <span className="changelog-version">{entry.version}</span>
+                <span className="changelog-date">{entry.date}</span>
+              </div>
+              <ul>
+                {entry.changes.map((c, i) => (
+                  <li key={i}>{c}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </section>
       </div>
 
       <style jsx global>{`
@@ -410,7 +804,16 @@ export default function Home() {
           border-radius: 8px;
           padding: 1.25rem;
         }
+        .card h2 {
+          font-size: 0.7rem;
+          letter-spacing: 0.12em;
+          text-transform: uppercase;
+          color: #555570;
+          margin-bottom: 0.9rem;
+        }
         .controls { display: flex; flex-direction: column; gap: 0.9rem; }
+        .discord { display: flex; flex-direction: column; gap: 0.75rem; }
+        .sound { display: flex; flex-direction: column; gap: 0.75rem; }
         .field-row { display: flex; align-items: center; gap: 0.75rem; }
         label {
           font-size: 0.72rem;
@@ -432,10 +835,67 @@ export default function Home() {
           outline: none;
           transition: border-color 0.15s;
         }
+        input[type="range"] {
+          padding: 0;
+          accent-color: #ff4444;
+        }
         input:focus, select:focus { border-color: #ff4444; }
         input:disabled, select:disabled { opacity: 0.4; cursor: not-allowed; }
+        .volume-value {
+          width: 56px;
+          flex-shrink: 0;
+          font-size: 0.8rem;
+          color: #888;
+          text-align: right;
+        }
         .error { font-size: 0.8rem; color: #ff4444; }
         .hint { font-size: 0.72rem; color: #666; margin-top: -4px; }
+        .link-btn {
+          background: none;
+          border: none;
+          padding: 0;
+          color: #ff8866;
+          font-family: inherit;
+          font-size: inherit;
+          font-weight: 600;
+          text-decoration: underline;
+          cursor: pointer;
+        }
+        .link-btn:disabled { opacity: 0.5; cursor: not-allowed; text-decoration: none; }
+        .checkbox-group {
+          display: flex;
+          flex-direction: column;
+          gap: 0.4rem;
+        }
+        .checkbox-group-label {
+          font-size: 0.65rem;
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+          color: #555570;
+        }
+        .checkbox-row {
+          display: flex;
+          align-items: center;
+          gap: 0.5rem;
+          font-size: 0.82rem;
+          color: #ccc;
+          text-transform: none;
+          letter-spacing: normal;
+          width: auto;
+          cursor: pointer;
+        }
+        .checkbox-row input[type="checkbox"] {
+          flex: none;
+          width: 14px;
+          height: 14px;
+          accent-color: #ff4444;
+        }
+        .spam-count {
+          width: 48px;
+          flex: none;
+          padding: 0.25rem 0.4rem;
+          text-align: center;
+        }
         .btn-row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
         button {
           font-family: inherit;
@@ -506,13 +966,6 @@ export default function Home() {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.2; }
         }
-        .log-card h2 {
-          font-size: 0.7rem;
-          letter-spacing: 0.12em;
-          text-transform: uppercase;
-          color: #555570;
-          margin-bottom: 0.75rem;
-        }
         .log {
           max-height: 340px;
           overflow-y: auto;
@@ -537,6 +990,50 @@ export default function Home() {
         .log-line.down  { color: #44aaff; background: #4488ff0a; }
         .log-ts { flex-shrink: 0; color: #333355; font-size: 0.7rem; }
         .log-msg { word-break: break-word; }
+        .changelog-entry {
+          padding-bottom: 0.9rem;
+          margin-bottom: 0.9rem;
+          border-bottom: 1px solid #1a1a26;
+        }
+        .changelog-entry:last-child {
+          padding-bottom: 0;
+          margin-bottom: 0;
+          border-bottom: none;
+        }
+        .changelog-head {
+          display: flex;
+          align-items: baseline;
+          gap: 0.6rem;
+          margin-bottom: 0.35rem;
+        }
+        .changelog-version {
+          font-size: 0.85rem;
+          font-weight: 700;
+          color: #e8e8f0;
+        }
+        .changelog-date {
+          font-size: 0.68rem;
+          color: #555570;
+        }
+        .changelog-entry ul {
+          list-style: none;
+          display: flex;
+          flex-direction: column;
+          gap: 0.3rem;
+        }
+        .changelog-entry li {
+          font-size: 0.78rem;
+          color: #999;
+          line-height: 1.4;
+          padding-left: 0.9rem;
+          position: relative;
+        }
+        .changelog-entry li::before {
+          content: '–';
+          position: absolute;
+          left: 0;
+          color: #444460;
+        }
       `}</style>
     </>
   );
