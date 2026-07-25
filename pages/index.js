@@ -5,6 +5,14 @@ import Head from "next/head";
 // Rendered as-is in the Changelog card at the bottom of the page.
 const CHANGELOG = [
   {
+    version: "v1.6",
+    date: "2026-07-25",
+    changes: [
+      "Fixed the event log auto-scrolling the whole page down on every single check, which made it impossible to scroll up and use settings while monitoring was running",
+      "Auto-scroll is now contained to the log box itself, and only kicks in if you were already near the bottom of it",
+    ],
+  },
+  {
     version: "v1.5",
     date: "2026-07-25",
     changes: [
@@ -113,7 +121,7 @@ export default function Home() {
   const timerRef = useRef(null);
   const lastPriceRef = useRef(undefined);
   const checkCountRef = useRef(0);
-  const logsEndRef = useRef(null);
+  const logContainerRef = useRef(null);
   const audioCtxRef = useRef(null);
   const activeRef = useRef(false); // true only while monitoring is actually running
   const abortRef = useRef(null); // AbortController for the in-flight request
@@ -183,9 +191,22 @@ export default function Home() {
     } catch (_) {}
   }, [settingsLoaded, webhookUrls, discordUserId, alertTypes, pingMe, spamPings, spamCount, volume]);
 
-  // Auto-scroll log
+  // Auto-scroll the log — but only WITHIN the log box itself (never the
+  // whole page), and only if you were already near the bottom of it.
+  // Previously this used scrollIntoView(), which drags the entire page
+  // scroll position down to the log on every single check — so scrolling
+  // up to look at settings while monitoring was running got constantly
+  // yanked back down. Now it leaves your page scroll alone entirely, and
+  // even inside the log box itself it won't interrupt you if you've
+  // scrolled up to read older entries.
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = logContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const wasNearBottom = distanceFromBottom < 80;
+    if (wasNearBottom) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [logs]);
 
   const pushLog = useCallback((msg, type = "info") => {
@@ -810,14 +831,13 @@ export default function Home() {
         {logs.length > 0 && (
           <section className="card log-card">
             <h2>Event log</h2>
-            <div className="log">
+            <div className="log" ref={logContainerRef}>
               {logs.map((l) => (
                 <div key={l.id} className={`log-line ${l.type}`}>
                   <span className="log-ts">{l.ts}</span>
                   <span className="log-msg">{l.msg}</span>
                 </div>
               ))}
-              <div ref={logsEndRef} />
             </div>
           </section>
         )}
