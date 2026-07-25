@@ -5,6 +5,22 @@ import Head from "next/head";
 // Rendered as-is in the Changelog card at the bottom of the page.
 const CHANGELOG = [
   {
+    version: "v1.5",
+    date: "2026-07-25",
+    changes: [
+      "Added support for multiple Discord webhook URLs",
+      "Spam pings now split round-robin across all configured webhooks, since each webhook has its own separate Discord rate limit — lets a burst land much faster during a short sale window",
+    ],
+  },
+  {
+    version: "v1.4",
+    date: "2026-07-25",
+    changes: [
+      "Raised the spam-ping cap from 5 to 20 messages",
+      "Added real handling for Discord's own rate limit during a spam-ping burst (respects retry_after instead of silently dropping messages)",
+    ],
+  },
+  {
     version: "v1.3",
     date: "2026-07-25",
     changes: [
@@ -45,6 +61,7 @@ const CHANGELOG = [
 ];
 
 const SETTINGS_KEY = "robloxMonitorSettings";
+const MAX_SPAM_PINGS = 20;
 
 const DISCORD_COLORS = {
   up: 0xff6644,
@@ -76,7 +93,7 @@ export default function Home() {
   const [swReg, setSwReg] = useState(null);
 
   // Discord webhook settings
-  const [webhookUrl, setWebhookUrl] = useState("");
+  const [webhookUrls, setWebhookUrls] = useState([""]);
   const [discordUserId, setDiscordUserId] = useState("");
   const [alertTypes, setAlertTypes] = useState({
     up: true,
@@ -106,7 +123,7 @@ export default function Home() {
   // don't want to be recreated on every keystroke (doCheck's dependency
   // chain in particular) can always read the *current* value without
   // needing to be in a dependency array.
-  const webhookUrlRef = useRef("");
+  const webhookUrlsRef = useRef([""]);
   const discordUserIdRef = useRef("");
   const alertTypesRef = useRef(alertTypes);
   const pingMeRef = useRef(false);
@@ -114,7 +131,7 @@ export default function Home() {
   const spamCountRef = useRef(3);
   const volumeRef = useRef(70);
 
-  useEffect(() => { webhookUrlRef.current = webhookUrl; }, [webhookUrl]);
+  useEffect(() => { webhookUrlsRef.current = webhookUrls; }, [webhookUrls]);
   useEffect(() => { discordUserIdRef.current = discordUserId; }, [discordUserId]);
   useEffect(() => { alertTypesRef.current = alertTypes; }, [alertTypes]);
   useEffect(() => { pingMeRef.current = pingMe; }, [pingMe]);
@@ -134,7 +151,12 @@ export default function Home() {
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-      if (typeof saved.webhookUrl === "string") setWebhookUrl(saved.webhookUrl);
+      if (Array.isArray(saved.webhookUrls) && saved.webhookUrls.length) {
+        setWebhookUrls(saved.webhookUrls);
+      } else if (typeof saved.webhookUrl === "string" && saved.webhookUrl) {
+        // Migrate from the old single-webhook setting
+        setWebhookUrls([saved.webhookUrl]);
+      }
       if (typeof saved.discordUserId === "string") setDiscordUserId(saved.discordUserId);
       if (saved.alertTypes) setAlertTypes({ up: true, down: true, offSale: true, backOnSale: true, ...saved.alertTypes });
       if (typeof saved.pingMe === "boolean") setPingMe(saved.pingMe);
@@ -156,10 +178,10 @@ export default function Home() {
     try {
       localStorage.setItem(
         SETTINGS_KEY,
-        JSON.stringify({ webhookUrl, discordUserId, alertTypes, pingMe, spamPings, spamCount, volume })
+        JSON.stringify({ webhookUrls, discordUserId, alertTypes, pingMe, spamPings, spamCount, volume })
       );
     } catch (_) {}
-  }, [settingsLoaded, webhookUrl, discordUserId, alertTypes, pingMe, spamPings, spamCount, volume]);
+  }, [settingsLoaded, webhookUrls, discordUserId, alertTypes, pingMe, spamPings, spamCount, volume]);
 
   // Auto-scroll log
   useEffect(() => {
@@ -248,10 +270,18 @@ export default function Home() {
   // `allowed_mentions.parse` is explicitly set to an empty array so
   // Discord will never resolve @everyone/@here/@role even if such text
   // somehow ended up in the message content. There is no way to target
-  // more than one user or a role/channel from this UI.
+  // more than one user or a role/channel from this UI — that stays true
+  // no matter how many webhooks are configured below.
+  //
+  // Multiple webhooks: each Discord webhook has its OWN independent rate
+  // limit (~5 requests / 2s). A single webhook can only physically keep
+  // up with so many spam pings before an item's ~15s sale window is
+  // over. Splitting the burst round-robin across several webhooks (all
+  // posting to the same channel is fine) lets far more messages land in
+  // the same few seconds, since they're separate buckets on Discord's end.
   const sendDiscordAlert = useCallback(async (kind, title, description) => {
-    const url = webhookUrlRef.current.trim();
-    if (!url) return { ok: false, reason: "No webhook URL configured." };
+    const urls = webhookUrlsRef.current.map((u) => u.trim()).filter(Boolean);
+    if (urls.length === 0) return { ok: false, reason: "No webhook URL configured." };
 
     if (kind !== "test" && !alertTypesRef.current[kind]) {
       return { ok: false, reason: "Alert type disabled." };
@@ -277,28 +307,59 @@ export default function Home() {
       },
     };
 
-    const times = spamPingsRef.current && shouldPing
-      ? Math.max(1, Math.min(spamCountRef.current, 5))
+    const totalMessages = spamPingsRef.current && shouldPing
+      ? Math.max(1, Math.min(spamCountRef.current, MAX_SPAM_PINGS))
       : 1;
 
-    let lastOk = true;
-    for (let i = 0; i < times; i++) {
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        lastOk = res.ok;
-      } catch (_) {
-        lastOk = false;
-      }
-      if (i < times - 1) await new Promise((r) => setTimeout(r, 500));
-    }
+    // Sends `count` messages to a single webhook, spaced out and
+    // honoring `retry_after` on a 429 so this webhook's own share
+    // arrives reliably even if Discord throttles it briefly.
+    const sendBatchToWebhook = async (url, count) => {
+      let lastOk = true;
+      let retries = 0;
+      for (let i = 0; i < count; i++) {
+        try {
+          const res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
 
-    return lastOk
+          if (res.status === 429 && retries < 5) {
+            retries++;
+            let retryAfterMs = 1000;
+            try {
+              const body = await res.json();
+              if (typeof body?.retry_after === "number") {
+                retryAfterMs = Math.ceil(body.retry_after * 1000);
+              }
+            } catch (_) {}
+            await new Promise((r) => setTimeout(r, retryAfterMs));
+            i--; // retry this same message instead of counting it as sent
+            continue;
+          }
+
+          lastOk = res.ok;
+        } catch (_) {
+          lastOk = false;
+        }
+        if (i < count - 1) await new Promise((r) => setTimeout(r, 700));
+      }
+      return lastOk;
+    };
+
+    // Round-robin the total message count across the configured webhooks
+    const counts = new Array(urls.length).fill(0);
+    for (let i = 0; i < totalMessages; i++) counts[i % urls.length]++;
+
+    const results = await Promise.all(
+      urls.map((url, idx) => (counts[idx] > 0 ? sendBatchToWebhook(url, counts[idx]) : true))
+    );
+
+    const anyOk = results.some(Boolean);
+    return anyOk
       ? { ok: true }
-      : { ok: false, reason: "Discord rejected the request — check the webhook URL." };
+      : { ok: false, reason: "Discord rejected the request — check the webhook URL(s)." };
   }, []);
 
   const handleTestDiscordAlert = async () => {
@@ -501,6 +562,14 @@ export default function Home() {
     setAlertTypes((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
+  const updateWebhookUrl = (idx, value) => {
+    setWebhookUrls((prev) => prev.map((u, i) => (i === idx ? value : u)));
+  };
+  const addWebhookUrl = () => setWebhookUrls((prev) => [...prev, ""]);
+  const removeWebhookUrl = (idx) => setWebhookUrls((prev) => prev.filter((_, i) => i !== idx));
+
+  const activeWebhookCount = webhookUrls.filter((u) => u.trim()).length;
+
   const discordIdValid = discordUserId === "" || /^\d{15,20}$/.test(discordUserId);
 
   return (
@@ -632,18 +701,32 @@ export default function Home() {
         <section className="card discord">
           <h2>Discord Alerts</h2>
 
-          <div className="field-row">
-            <label htmlFor="webhookUrl">Webhook URL</label>
-            <input
-              id="webhookUrl"
-              type="password"
-              placeholder="https://discord.com/api/webhooks/..."
-              value={webhookUrl}
-              onChange={(e) => setWebhookUrl(e.target.value)}
-            />
+          <div className="webhook-list">
+            {webhookUrls.map((url, idx) => (
+              <div className="field-row" key={idx}>
+                <label htmlFor={`webhookUrl-${idx}`}>{idx === 0 ? "Webhook URL" : ""}</label>
+                <input
+                  id={`webhookUrl-${idx}`}
+                  type="password"
+                  placeholder="https://discord.com/api/webhooks/..."
+                  value={url}
+                  onChange={(e) => updateWebhookUrl(idx, e.target.value)}
+                />
+                {webhookUrls.length > 1 && (
+                  <button type="button" className="link-btn" onClick={() => removeWebhookUrl(idx)}>
+                    Remove
+                  </button>
+                )}
+              </div>
+            ))}
+            <button type="button" className="btn-notif add-webhook-btn" onClick={addWebhookUrl}>
+              + Add another webhook
+            </button>
           </div>
           <p className="hint">
-            Server Settings → Integrations → Webhooks → New Webhook → Copy URL.
+            Server Settings → Integrations → Webhooks → New Webhook → Copy URL. Add a few pointed at the
+            same channel — each webhook has its own Discord rate limit, so spam pings get spread across
+            them and land faster when a sale window is short.
           </p>
 
           <div className="field-row">
@@ -699,20 +782,22 @@ export default function Home() {
             <input
               type="number"
               min={1}
-              max={5}
+              max={MAX_SPAM_PINGS}
               value={spamCount}
               disabled={!pingMe || !spamPings}
-              onChange={(e) => setSpamCount(Math.max(1, Math.min(5, Number(e.target.value) || 1)))}
+              onChange={(e) => setSpamCount(Math.max(1, Math.min(MAX_SPAM_PINGS, Number(e.target.value) || 1)))}
               className="spam-count"
             />
             times in a row so it's not missed)
           </label>
           <p className="hint">
-            Capped at 5 messages, and always targeted at your single user ID only — this can't be used to mass-ping a server.
+            Capped at {MAX_SPAM_PINGS} messages, split round-robin across every webhook URL above
+            {activeWebhookCount > 1 ? ` (currently ${activeWebhookCount} webhooks, so they land roughly ${activeWebhookCount}× faster)` : " — add more webhooks above to make a burst land faster"}.
+            Still always targeted at your single user ID only, so this can't be used to mass-ping a server.
           </p>
 
           <div className="btn-row">
-            <button className="btn-notif" onClick={handleTestDiscordAlert} disabled={!webhookUrl.trim()}>
+            <button className="btn-notif" onClick={handleTestDiscordAlert} disabled={activeWebhookCount === 0}>
               {discordStatus === "sending" ? "Sending…" : "Send test alert"}
             </button>
             {discordStatus === "sent" && <span className="notif-on">✓ Sent</span>}
@@ -815,6 +900,8 @@ export default function Home() {
         .discord { display: flex; flex-direction: column; gap: 0.75rem; }
         .sound { display: flex; flex-direction: column; gap: 0.75rem; }
         .field-row { display: flex; align-items: center; gap: 0.75rem; }
+        .webhook-list { display: flex; flex-direction: column; gap: 0.5rem; }
+        .add-webhook-btn { align-self: flex-start; }
         label {
           font-size: 0.72rem;
           letter-spacing: 0.1em;

@@ -57,9 +57,12 @@ export default async function handler(req, res) {
   let lastStatus = null;
   let sawRateLimit = false;
 
+  // Prefer surfacing a 429 status over any other status, since that's
+  // the actually-useful signal for the client to act on. Otherwise keep
+  // whichever status we saw first.
   const noteStatus = (r) => {
     if (!r) return;
-    if (lastStatus == null) lastStatus = r.status;
+    if (lastStatus == null || r.status === 429) lastStatus = r.status;
     if (r.status === 429) sawRateLimit = true;
   };
 
@@ -83,8 +86,11 @@ export default async function handler(req, res) {
     }
   }
 
-  // Stage 2 — only run if stage 1 didn't give us both a name and a price
-  if (price == null || itemName == null) {
+  // Stage 2 — only run if stage 1 didn't give us both a name and a price,
+  // AND we're not already being rate limited. Firing 2 more requests while
+  // Roblox is already 429ing us just digs the hole deeper instead of
+  // backing off.
+  if ((price == null || itemName == null) && !sawRateLimit) {
     const [rResale, rMarketplace] = await Promise.all([
       call(`https://economy.roblox.com/v1/assets/${id}/resale-data`),
       call(`https://marketplace.roblox.com/v1/assets/${id}/resellers?limit=1`),
